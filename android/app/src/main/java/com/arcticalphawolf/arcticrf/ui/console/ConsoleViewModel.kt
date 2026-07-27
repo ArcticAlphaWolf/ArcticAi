@@ -27,4 +27,9 @@ class ConsoleViewModel(private val repo: BoardRepository) : ViewModel() {
         _log.value = _log.value + "> $command"
         repo.sendRaw(command)
     }
+
+    fun simulateDemo() {
+        _log.value = _log.value + "> (simulating demo board data...)"
+        repo.simulateDemoData()
+    }
 }

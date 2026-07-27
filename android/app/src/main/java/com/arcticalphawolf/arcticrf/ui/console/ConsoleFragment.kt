@@ -40,6 +40,7 @@ class ConsoleFragment : Fragment() {
         }
         binding.btnSend.setOnClickListener { sendCommand() }
         binding.commandInput.setOnEditorActionListener { _, _, _ -> sendCommand(); true }
+        binding.btnSimulate.setOnClickListener { viewModel.simulateDemo() }
 
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {

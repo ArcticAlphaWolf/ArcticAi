@@ -3,27 +3,64 @@ package com.arcticalphawolf.arcticrf.data
 import com.arcticalphawolf.arcticrf.usb.ConnectionState
 import com.arcticalphawolf.arcticrf.usb.UsbSerialManager
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /** Single point of access for the rest of the app: typed board events out, simple command calls in. */
-class BoardRepository(private val usb: UsbSerialManager, scope: CoroutineScope) {
+class BoardRepository(private val usb: UsbSerialManager, private val scope: CoroutineScope) {
 
     val connectionState: StateFlow<ConnectionState> = usb.connectionState
 
     private val _events = MutableSharedFlow<BoardEvent>(extraBufferCapacity = 256)
     val events: SharedFlow<BoardEvent> = _events.asSharedFlow()
 
+    // Lets simulateDemoData() feed canned lines through the exact same path
+    // real hardware lines take, so the demo exercises real parsing/UI code.
+    private val _demoLines = MutableSharedFlow<String>(extraBufferCapacity = 64)
+
     /** Every raw line, unparsed - feeds the Console tab. */
-    val rawLines: SharedFlow<String> = usb.lines
+    val rawLines: Flow<String> = merge(usb.lines, _demoLines)
 
     init {
         scope.launch {
-            usb.lines.map { BoardEventParser.parse(it) }.collect { _events.emit(it) }
+            rawLines.map { BoardEventParser.parse(it) }.collect { _events.emit(it) }
+        }
+    }
+
+    /**
+     * No board plugged in? Feeds a canned sequence of protocol lines through
+     * the real parser so every tab can be clicked through end-to-end (saving
+     * a captured signal, browsing scan/BLE results, GPIO readback) without
+     * hardware attached.
+     */
+    fun simulateDemoData() {
+        scope.launch {
+            _demoLines.emit(
+                "RF_CAPTURE {\"freq\":433.92,\"protocol\":\"RAW_OOK\",\"count\":24," +
+                    "\"csv\":\"320,640,320,640,960,320,320,640,960,320,320,640,320,640,960,320,320,640,960,320,320,640,320,640\"}"
+            )
+            delay(400)
+            _demoLines.emit(
+                "WIFI_SCAN_RESULT [" +
+                    "{\"ssid\":\"HomeWiFi\",\"bssid\":\"AA:BB:CC:DD:EE:01\",\"rssi\":-42,\"channel\":6,\"encryption\":\"WPA2_PSK\"}," +
+                    "{\"ssid\":\"Neighbor_2G\",\"bssid\":\"AA:BB:CC:DD:EE:02\",\"rssi\":-68,\"channel\":11,\"encryption\":\"WPA2_PSK\"}," +
+                    "{\"ssid\":\"CoffeeShop_Guest\",\"bssid\":\"AA:BB:CC:DD:EE:03\",\"rssi\":-79,\"channel\":1,\"encryption\":\"OPEN\"}]"
+            )
+            delay(400)
+            _demoLines.emit(
+                "BLE_SCAN_RESULT [" +
+                    "{\"mac\":\"11:22:33:44:55:66\",\"name\":\"Pixel Buds\",\"rssi\":-51,\"mfgData\":\"4C000215\"}," +
+                    "{\"mac\":\"AA:11:BB:22:CC:33\",\"name\":\"\",\"rssi\":-74,\"mfgData\":\"\"}]"
+            )
+            delay(400)
+            _demoLines.emit("GPIO_VALUE {\"pin\":4,\"value\":1}")
         }
     }
 
