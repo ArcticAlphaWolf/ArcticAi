@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arctic_primary">#4FC3F7</color>
+    <color name="arctic_primary_dark">#0288D1</color>
+    <color name="arctic_bg_dark">#0B1720</color>
+    <color name="arctic_surface_dark">#12222E</color>
+    <color name="arctic_bg_light">#F2FBFF</color>
+    <color name="arctic_surface_light">#FFFFFF</color>
+    <color name="arctic_accent">#00E5B0</color>
+    <color name="arctic_warn">#FF5252</color>
+    <color name="arctic_text_dark">#E6F6FF</color>
+    <color name="arctic_text_light">#0B1720</color>
+</resources>

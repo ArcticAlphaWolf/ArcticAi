@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Arctic RF</string>
+
+    <string name="nav_subghz">Sub-GHz</string>
+    <string name="nav_wifi">Wi-Fi</string>
+    <string name="nav_ble">BLE</string>
+    <string name="nav_gpio">GPIO</string>
+    <string name="nav_console">Console</string>
+
+    <string name="status_disconnected">Board not connected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected: %1$s</string>
+    <string name="status_permission_denied">USB permission denied</string>
+
+    <string name="btn_listen">RF_LISTEN</string>
+    <string name="btn_listening">Listening…</string>
+    <string name="btn_scan">Scan networks</string>
+    <string name="btn_scanning">Scanning…</string>
+    <string name="btn_sniff_start">Start sniff</string>
+    <string name="btn_sniff_stop">Stop sniff</string>
+    <string name="btn_ble_scan">Scan BLE</string>
+
+    <string name="dialog_add_device_title">Signal captured</string>
+    <string name="dialog_device_name_hint">Name (e.g. \"Garage door\")</string>
+    <string name="dialog_save">Save</string>
+    <string name="dialog_cancel">Cancel</string>
+
+    <string name="empty_saved_devices">No saved signals yet. Tap RF_LISTEN and trigger a remote near the CC1101 antenna.</string>
+    <string name="empty_wifi_results">No results yet. Tap \"Scan networks\" while connected to the board.</string>
+    <string name="empty_ble_results">No BLE devices yet.</string>
+
+    <string name="alert_deauth_title">Deauth/disassoc detected</string>
+
+    <string name="menu_export">Export</string>
+    <string name="menu_delete">Delete</string>
+</resources>
