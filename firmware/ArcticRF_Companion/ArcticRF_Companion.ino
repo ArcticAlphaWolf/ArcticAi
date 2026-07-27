@@ -424,7 +424,7 @@ void doBleScan(int seconds) {
   NimBLEDevice::init("");
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(false); // passive: don't send scan-request frames
-  NimBLEScanResults results = scan->getResults(seconds * 1000, false);
+  NimBLEScanResults results = scan->start(seconds, false);
 
   StaticJsonDocument<8192> doc;
   JsonArray arr = doc.to<JsonArray>();
