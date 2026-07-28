@@ -252,22 +252,23 @@ void rfTask(void *arg) {
         continue;
       }
 
+      // Hand-built instead of ArduinoJson: a 4096-byte StaticJsonDocument as
+      // a local here would reserve its whole frame on rfTask's own 4096-byte
+      // stack the instant rfTask is entered (C++ sizes a function's stack
+      // frame for all its locals up front, not lazily per branch) - an
+      // immediate, guaranteed stack overflow into adjacent heap memory. The
+      // app only ever reads freq/protocol/count/csv, so there's no need for
+      // a JSON array here either.
       int n = rfPulseCount;
-      StaticJsonDocument<4096> doc;
-      doc["freq"] = ELECHOUSE_cc1101.getMHZ();
-      doc["protocol"] = "RAW_OOK";
-      doc["count"] = n;
-      JsonArray arr = doc.createNestedArray("pulses");
       String csv;
       csv.reserve(n * 6);
       for (int i = 0; i < n; i++) {
-        arr.add(rfPulses[i]);
         if (i) csv += ',';
         csv += rfPulses[i];
       }
-      doc["csv"] = csv;
-      String out;
-      serializeJson(doc, out);
+      String out = "{\"freq\":" + String(ELECHOUSE_cc1101.getMHZ(), 2) +
+                   ",\"protocol\":\"RAW_OOK\",\"count\":" + String(n) +
+                   ",\"csv\":\"" + csv + "\"}";
       printLine("RF_CAPTURE " + out);
     }
   }
@@ -306,7 +307,11 @@ void doWifiScan() {
   delay(50);
   // passive=true: we only listen for beacons, we never actively probe.
   int n = WiFi.scanNetworks(false, false, true, 250);
-  StaticJsonDocument<8192> doc;
+  // Heap-backed (not a stack-local StaticJsonDocument): an 8192-byte fixed
+  // buffer as a local here would reserve its whole frame on wifiTask's own
+  // 8192-byte stack on entry, overflowing it into adjacent heap memory
+  // before a single network is even added.
+  DynamicJsonDocument doc(8192);
   JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < n; i++) {
     JsonObject o = arr.createNestedObject();
@@ -426,7 +431,10 @@ void doBleScan(int seconds) {
   scan->setActiveScan(false); // passive: don't send scan-request frames
   NimBLEScanResults results = scan->start(seconds, false);
 
-  StaticJsonDocument<8192> doc;
+  // Heap-backed for the same reason as doWifiScan(): doBleScan() runs
+  // inline on the main loop task, and a stack-local 8192-byte document
+  // would overflow that task's stack the moment this function is entered.
+  DynamicJsonDocument doc(8192);
   JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < results.getCount(); i++) {
     NimBLEAdvertisedDevice d = results.getDevice(i);
@@ -565,9 +573,11 @@ void setup() {
   ELECHOUSE_cc1101.setPA(10);
 
   // RF work pinned to core 1 (timing-critical ISR + tight polling loop).
-  xTaskCreatePinnedToCore(rfTask, "rfTask", 4096, nullptr, 2, nullptr, 1);
+  // Extra headroom beyond rfTask's own small locals now that RF_CAPTURE no
+  // longer builds a large JSON document on this stack (see rfTask()).
+  xTaskCreatePinnedToCore(rfTask, "rfTask", 6144, nullptr, 2, nullptr, 1);
   // Wi-Fi/BLE work pinned to core 0, isolated from the CC1101 ISR core.
-  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 10240, nullptr, 1, nullptr, 0);
 
   printLine("VERSION ArcticRF-1.0");
 }
