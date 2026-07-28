@@ -7,7 +7,6 @@
     <string name="nav_ble">BLE</string>
     <string name="nav_gpio">GPIO</string>
     <string name="nav_console">Console</string>
-    <string name="nav_debug">Debug</string>
 
     <string name="status_disconnected">Board not connected</string>
     <string name="status_connecting">Connecting…</string>
