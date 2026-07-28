@@ -80,6 +80,12 @@ class UsbSerialManager(private val context: Context) {
     private var reconnectAttempts = 0
     private val maxReconnectAttempts = 3
 
+    // Guards against overlapping connectToDevice() calls: MainActivity.onResume()
+    // calls tryAutoConnect() unconditionally on every resume, which can race
+    // with an in-flight reconnect-after-error coroutine and try to open the
+    // same port twice ("Already open"), corrupting the retry-count bookkeeping.
+    @Volatile private var isConnecting = false
+
     private var receiversRegistered = false
 
     private val usbReceiver = object : BroadcastReceiver() {
@@ -129,6 +135,9 @@ class UsbSerialManager(private val context: Context) {
 
     /** Called on app launch and whenever we should re-scan for an already-plugged-in board. */
     fun tryAutoConnect() {
+        if (port != null && _connectionState.value is ConnectionState.Connected) {
+            return // already connected - MainActivity.onResume() calls this unconditionally
+        }
         val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         val found = availableDrivers.firstOrNull() ?: run {
             _connectionState.value = ConnectionState.Disconnected
@@ -167,13 +176,23 @@ class UsbSerialManager(private val context: Context) {
     }
 
     private fun connectToDevice(device: UsbDevice) {
-        val currentDriver = driver ?: UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
+        if (isConnecting) {
+            _diagnostics.tryEmit("Connect already in progress, skipping duplicate request")
+            return
+        }
+        // Always re-probe a fresh driver/port rather than reusing the cached
+        // `driver` field: usb-serial-for-android's port objects track open/
+        // closed state internally, and reusing one whose close() hasn't fully
+        // settled yet throws "Already open" on the next open() attempt.
+        val currentDriver = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
             .firstOrNull { it.device == device } ?: return
+        driver = currentDriver
         val connection = usbManager.openDevice(device)
         if (connection == null) {
             _connectionState.value = ConnectionState.Disconnected
             return
         }
+        isConnecting = true
         try {
             val p = currentDriver.ports[0]
             p.open(connection)
@@ -212,6 +231,8 @@ class UsbSerialManager(private val context: Context) {
         } catch (e: Exception) {
             _diagnostics.tryEmit("Connect failed: ${e.message ?: e.javaClass.simpleName}")
             _connectionState.value = ConnectionState.Disconnected
+        } finally {
+            isConnecting = false
         }
     }
 
