@@ -25,8 +25,11 @@ class BoardRepository(private val usb: UsbSerialManager, private val scope: Coro
     // real hardware lines take, so the demo exercises real parsing/UI code.
     private val _demoLines = MutableSharedFlow<String>(extraBufferCapacity = 64)
 
-    /** Every raw line, unparsed - feeds the Console tab. */
+    /** Every raw board/demo line, unparsed - this is what gets fed to BoardEventParser. */
     val rawLines: Flow<String> = merge(usb.lines, _demoLines)
+
+    /** rawLines plus connection diagnostics (IO errors, reconnect attempts) - feeds the Console tab. */
+    val consoleLines: Flow<String> = merge(rawLines, usb.diagnostics.map { "# $it" })
 
     init {
         scope.launch {

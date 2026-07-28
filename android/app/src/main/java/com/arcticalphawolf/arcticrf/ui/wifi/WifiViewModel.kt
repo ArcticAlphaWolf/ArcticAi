@@ -7,10 +7,14 @@ import com.arcticalphawolf.arcticrf.data.BoardRepository
 import com.arcticalphawolf.arcticrf.data.DeauthAlert
 import com.arcticalphawolf.arcticrf.data.WifiNetwork
 import com.arcticalphawolf.arcticrf.data.WifiSniffEntry
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+private const val SCAN_TIMEOUT_MS = 10_000L
 
 class WifiViewModel(private val repo: BoardRepository) : ViewModel() {
 
@@ -29,11 +33,17 @@ class WifiViewModel(private val repo: BoardRepository) : ViewModel() {
     private val _alert = MutableStateFlow<DeauthAlert?>(null)
     val alert: StateFlow<DeauthAlert?> = _alert.asStateFlow()
 
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
+
+    private var scanTimeoutJob: Job? = null
+
     init {
         viewModelScope.launch {
             repo.events.collect { event ->
                 when (event) {
                     is BoardEvent.WifiScanResult -> {
+                        scanTimeoutJob?.cancel()
                         _scanning.value = false
                         _scanResults.value = event.networks
                     }
@@ -48,6 +58,16 @@ class WifiViewModel(private val repo: BoardRepository) : ViewModel() {
     fun onScanClicked() {
         _scanning.value = true
         repo.wifiScan()
+        scanTimeoutJob?.cancel()
+        scanTimeoutJob = viewModelScope.launch {
+            delay(SCAN_TIMEOUT_MS)
+            _scanning.value = false
+            _error.value = "No response from board - check the firmware is flashed and running"
+        }
+    }
+
+    fun consumeError() {
+        _error.value = null
     }
 
     fun onSniffToggle(enabled: Boolean, channel: Int) {

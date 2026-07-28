@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.Lifecycle
@@ -53,6 +54,14 @@ class BleFragment : Fragment() {
                     viewModel.scanning.collect { scanning ->
                         binding.btnBleScan.text = getString(if (scanning) R.string.btn_scanning else R.string.btn_ble_scan)
                         binding.btnBleScan.isEnabled = !scanning
+                    }
+                }
+                launch {
+                    viewModel.error.collect { msg ->
+                        if (msg != null) {
+                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            viewModel.consumeError()
+                        }
                     }
                 }
             }

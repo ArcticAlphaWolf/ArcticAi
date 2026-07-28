@@ -15,7 +15,7 @@ class ConsoleViewModel(private val repo: BoardRepository) : ViewModel() {
 
     init {
         viewModelScope.launch {
-            repo.rawLines.collect { line ->
+            repo.consoleLines.collect { line ->
                 val updated = _log.value + line
                 _log.value = if (updated.size > 500) updated.takeLast(500) else updated
             }

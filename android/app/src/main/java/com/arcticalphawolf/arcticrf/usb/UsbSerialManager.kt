@@ -12,12 +12,17 @@ import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 
 sealed class ConnectionState {
@@ -50,6 +55,16 @@ class UsbSerialManager(private val context: Context) {
 
     private val _lines = MutableSharedFlow<String>(extraBufferCapacity = 512)
     val lines: SharedFlow<String> = _lines.asSharedFlow()
+
+    // Connection-state diagnostics (IO errors, reconnect attempts) - purely
+    // informational, feeds the Console tab so flaky-USB symptoms are visible
+    // instead of just silently dropping back to "disconnected".
+    private val _diagnostics = MutableSharedFlow<String>(extraBufferCapacity = 32)
+    val diagnostics: SharedFlow<String> = _diagnostics.asSharedFlow()
+
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var reconnectAttempts = 0
+    private val maxReconnectAttempts = 3
 
     private var receiversRegistered = false
 
@@ -153,12 +168,54 @@ class UsbSerialManager(private val context: Context) {
             readBuffer.setLength(0)
             ioManager = SerialInputOutputManager(p, object : SerialInputOutputManager.Listener {
                 override fun onNewData(data: ByteArray) = onBytesReceived(data)
-                override fun onRunError(e: Exception) = disconnect()
+                override fun onRunError(e: Exception) = handleIoError(device, e)
             })
             Executors.newSingleThreadExecutor().submit(ioManager)
+            reconnectAttempts = 0
             _connectionState.value = ConnectionState.Connected(device.deviceName)
         } catch (e: Exception) {
             _connectionState.value = ConnectionState.Disconnected
+        }
+    }
+
+    /**
+     * A read/write error on the IO thread doesn't necessarily mean the board
+     * was unplugged - flaky OTG cables/adapters and USB host power hiccups
+     * are common with ESP32 boards, especially right after a power-hungry
+     * radio operation. Instead of dropping straight to "disconnected" (which
+     * would force a manual replug), retry a few times first; a real unplug
+     * is still caught separately via ACTION_USB_DEVICE_DETACHED.
+     */
+    private fun handleIoError(device: UsbDevice, e: Exception) {
+        _diagnostics.tryEmit("USB IO error: ${e.message ?: e.javaClass.simpleName}")
+        closePortQuietly()
+        ioScope.launch {
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                _diagnostics.tryEmit("Giving up after $maxReconnectAttempts reconnect attempts")
+                _connectionState.value = ConnectionState.Disconnected
+                return@launch
+            }
+            reconnectAttempts++
+            _connectionState.value = ConnectionState.Connecting
+            delay(800L * reconnectAttempts)
+            if (usbManager.deviceList.values.none { it.deviceName == device.deviceName }) {
+                _diagnostics.tryEmit("Device no longer present")
+                _connectionState.value = ConnectionState.Disconnected
+                return@launch
+            }
+            _diagnostics.tryEmit("Reconnect attempt $reconnectAttempts/$maxReconnectAttempts...")
+            connectToDevice(device)
+        }
+    }
+
+    private fun closePortQuietly() {
+        try {
+            ioManager?.stop()
+            port?.close()
+        } catch (_: Exception) {
+        } finally {
+            ioManager = null
+            port = null
         }
     }
 
@@ -185,15 +242,9 @@ class UsbSerialManager(private val context: Context) {
     }
 
     fun disconnect() {
-        try {
-            ioManager?.stop()
-            port?.close()
-        } catch (_: Exception) {
-        } finally {
-            ioManager = null
-            port = null
-            _connectionState.value = ConnectionState.Disconnected
-        }
+        closePortQuietly()
+        reconnectAttempts = 0
+        _connectionState.value = ConnectionState.Disconnected
     }
 }
 
