@@ -18,6 +18,16 @@ class BoardRepository(private val usb: UsbSerialManager, private val scope: Coro
 
     val connectionState: StateFlow<ConnectionState> = usb.connectionState
 
+    // Debug tab passthroughs.
+    val bytesSent: StateFlow<Long> = usb.bytesSent
+    val bytesReceived: StateFlow<Long> = usb.bytesReceived
+    val rawHexTail: StateFlow<String> = usb.rawHexTail
+    val controlLines: StateFlow<String> = usb.controlLines
+    val deviceInfo: StateFlow<String> = usb.deviceInfo
+    fun setDtr(value: Boolean) = usb.setDtr(value)
+    fun setRts(value: Boolean) = usb.setRts(value)
+    fun reconnect() = usb.tryAutoConnect()
+
     private val _events = MutableSharedFlow<BoardEvent>(extraBufferCapacity = 256)
     val events: SharedFlow<BoardEvent> = _events.asSharedFlow()
 

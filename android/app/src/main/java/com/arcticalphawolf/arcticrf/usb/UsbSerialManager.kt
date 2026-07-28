@@ -62,6 +62,20 @@ class UsbSerialManager(private val context: Context) {
     private val _diagnostics = MutableSharedFlow<String>(extraBufferCapacity = 32)
     val diagnostics: SharedFlow<String> = _diagnostics.asSharedFlow()
 
+    // Debug-tab visibility: raw traffic counters/tail and current control-line
+    // state, so a silent link (board not replying) can actually be diagnosed
+    // from the phone instead of guessed at.
+    private val _bytesSent = MutableStateFlow(0L)
+    val bytesSent: StateFlow<Long> = _bytesSent.asStateFlow()
+    private val _bytesReceived = MutableStateFlow(0L)
+    val bytesReceived: StateFlow<Long> = _bytesReceived.asStateFlow()
+    private val _rawHexTail = MutableStateFlow("")
+    val rawHexTail: StateFlow<String> = _rawHexTail.asStateFlow()
+    private val _controlLines = MutableStateFlow("")
+    val controlLines: StateFlow<String> = _controlLines.asStateFlow()
+    private val _deviceInfo = MutableStateFlow("")
+    val deviceInfo: StateFlow<String> = _deviceInfo.asStateFlow()
+
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var reconnectAttempts = 0
     private val maxReconnectAttempts = 3
@@ -164,8 +178,30 @@ class UsbSerialManager(private val context: Context) {
             val p = currentDriver.ports[0]
             p.open(connection)
             p.setParameters(BAUD_RATE, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+
+            // Some ESP32 boards' auto-reset circuit wires DTR/RTS through to
+            // EN/GPIO0. If either line is left asserted after open() (driver-
+            // or OS-dependent default), the chip can be held in reset for as
+            // long as the port stays open - CP2102 itself still enumerates
+            // fine (so the app shows "Connected"), but the ESP32 never boots
+            // and never says a word. Explicitly release both right away.
+            try {
+                p.dtr = false
+                p.rts = false
+                _diagnostics.tryEmit("DTR/RTS cleared on connect")
+            } catch (e: Exception) {
+                _diagnostics.tryEmit("DTR/RTS not supported on this port: ${e.message ?: e.javaClass.simpleName}")
+            }
+            refreshControlLines(p)
+
             port = p
             readBuffer.setLength(0)
+            _bytesSent.value = 0
+            _bytesReceived.value = 0
+            _rawHexTail.value = ""
+            _deviceInfo.value = "VID=%04X PID=%04X %s".format(
+                device.vendorId, device.productId, device.deviceName
+            )
             ioManager = SerialInputOutputManager(p, object : SerialInputOutputManager.Listener {
                 override fun onNewData(data: ByteArray) = onBytesReceived(data)
                 override fun onRunError(e: Exception) = handleIoError(device, e)
@@ -174,7 +210,41 @@ class UsbSerialManager(private val context: Context) {
             reconnectAttempts = 0
             _connectionState.value = ConnectionState.Connected(device.deviceName)
         } catch (e: Exception) {
+            _diagnostics.tryEmit("Connect failed: ${e.message ?: e.javaClass.simpleName}")
             _connectionState.value = ConnectionState.Disconnected
+        }
+    }
+
+    private fun refreshControlLines(p: UsbSerialPort) {
+        try {
+            _controlLines.value = "DTR=${p.dtr} RTS=${p.rts}"
+        } catch (_: Exception) {
+            _controlLines.value = "unsupported"
+        }
+    }
+
+    /** Manual DTR/RTS control for the Debug tab - lets a stuck connection be poked live. */
+    fun setDtr(value: Boolean) {
+        val p = port ?: return
+        try {
+            p.dtr = value
+            _diagnostics.tryEmit("DTR set to $value")
+        } catch (e: Exception) {
+            _diagnostics.tryEmit("setDTR failed: ${e.message ?: e.javaClass.simpleName}")
+        } finally {
+            refreshControlLines(p)
+        }
+    }
+
+    fun setRts(value: Boolean) {
+        val p = port ?: return
+        try {
+            p.rts = value
+            _diagnostics.tryEmit("RTS set to $value")
+        } catch (e: Exception) {
+            _diagnostics.tryEmit("setRTS failed: ${e.message ?: e.javaClass.simpleName}")
+        } finally {
+            refreshControlLines(p)
         }
     }
 
@@ -220,6 +290,8 @@ class UsbSerialManager(private val context: Context) {
     }
 
     private fun onBytesReceived(data: ByteArray) {
+        _bytesReceived.value += data.size
+        appendHexTail(data)
         synchronized(readBuffer) {
             readBuffer.append(String(data, Charsets.US_ASCII))
             var idx: Int
@@ -235,9 +307,21 @@ class UsbSerialManager(private val context: Context) {
     fun send(command: String) {
         val p = port ?: return
         try {
-            p.write((command + "\n").toByteArray(Charsets.US_ASCII), 500)
-        } catch (_: Exception) {
+            val bytes = (command + "\n").toByteArray(Charsets.US_ASCII)
+            p.write(bytes, 500)
+            _bytesSent.value += bytes.size
+        } catch (e: Exception) {
+            _diagnostics.tryEmit("write() failed: ${e.message ?: e.javaClass.simpleName}")
             disconnect()
+        }
+    }
+
+    private val hexTailBytes = ArrayDeque<Byte>()
+    private fun appendHexTail(data: ByteArray) {
+        synchronized(hexTailBytes) {
+            data.forEach { hexTailBytes.addLast(it) }
+            while (hexTailBytes.size > 128) hexTailBytes.removeFirst()
+            _rawHexTail.value = hexTailBytes.joinToString(" ") { "%02X".format(it) }
         }
     }
 

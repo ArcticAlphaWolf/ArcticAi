@@ -12,6 +12,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.arcticalphawolf.arcticrf.databinding.ActivityMainBinding
 import com.arcticalphawolf.arcticrf.ui.ble.BleFragment
 import com.arcticalphawolf.arcticrf.ui.console.ConsoleFragment
+import com.arcticalphawolf.arcticrf.ui.debug.DebugFragment
 import com.arcticalphawolf.arcticrf.ui.gpio.GpioFragment
 import com.arcticalphawolf.arcticrf.ui.subghz.SubGhzFragment
 import com.arcticalphawolf.arcticrf.ui.wifi.WifiFragment
@@ -41,6 +42,7 @@ class MainActivity : AppCompatActivity() {
                 R.id.nav_ble -> BleFragment()
                 R.id.nav_gpio -> GpioFragment()
                 R.id.nav_console -> ConsoleFragment()
+                R.id.nav_debug -> DebugFragment()
                 else -> return@setOnItemSelectedListener false
             }
             supportFragmentManager.beginTransaction()
