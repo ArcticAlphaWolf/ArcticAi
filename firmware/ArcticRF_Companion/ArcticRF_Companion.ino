@@ -327,6 +327,51 @@ void doWifiScan() {
   WiFi.scanDelete();
 }
 
+// Beacon/probe dedup + rate-limit: a dense real-world WiFi environment emits
+// the same beacons every ~100ms from every nearby AP plus a probe request
+// per nearby client, and each hit here was doing a blocking mutex-guarded
+// Serial.println() - against Espressif's own guidance against lengthy work
+// in the promiscuous callback, and enough sustained volume to overwhelm the
+// phone-side RecyclerView/JSON pipeline. This drops repeat sightings of the
+// same MAC+frame-type within a short window and enforces a hard minimum
+// gap between any two emitted lines as a safety floor.
+#define SNIFF_DEDUP_SIZE 24
+#define SNIFF_DEDUP_WINDOW_MS 3000
+#define SNIFF_MIN_EMIT_GAP_MS 15
+struct SniffSeen { uint8_t mac[6]; uint8_t type; uint32_t lastMs; };
+static SniffSeen sniffSeen[SNIFF_DEDUP_SIZE];
+static int sniffSeenCount = 0;
+static uint32_t lastSniffEmitMs = 0;
+
+static bool sniffShouldEmit(const uint8_t *mac, uint8_t type) {
+  uint32_t now = millis();
+  if (now - lastSniffEmitMs < SNIFF_MIN_EMIT_GAP_MS) return false;
+
+  for (int i = 0; i < sniffSeenCount; i++) {
+    if (sniffSeen[i].type == type && memcmp(sniffSeen[i].mac, mac, 6) == 0) {
+      if (now - sniffSeen[i].lastMs < SNIFF_DEDUP_WINDOW_MS) return false;
+      sniffSeen[i].lastMs = now;
+      lastSniffEmitMs = now;
+      return true;
+    }
+  }
+
+  int slot;
+  if (sniffSeenCount < SNIFF_DEDUP_SIZE) {
+    slot = sniffSeenCount++;
+  } else {
+    slot = 0;
+    for (int i = 1; i < SNIFF_DEDUP_SIZE; i++) {
+      if (sniffSeen[i].lastMs < sniffSeen[slot].lastMs) slot = i;
+    }
+  }
+  memcpy(sniffSeen[slot].mac, mac, 6);
+  sniffSeen[slot].type = type;
+  sniffSeen[slot].lastMs = now;
+  lastSniffEmitMs = now;
+  return true;
+}
+
 // Minimal 802.11 management-frame parser: pulls the SSID tag and reports
 // beacon / probe-request metadata, and separately raises an alert on
 // deauth/disassoc frames (passive intrusion-detection signal only - this
@@ -343,6 +388,7 @@ void IRAM_ATTR wifiSniffCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
   snprintf(srcMac, sizeof(srcMac), "%02X:%02X:%02X:%02X:%02X:%02X",
            payload[10], payload[11], payload[12], payload[13], payload[14], payload[15]);
 
+  // Deauth/disassoc alerts are rare and security-relevant - never dedup those.
   if (fcSubtype == 0x0C /* deauth */ || fcSubtype == 0x0A /* disassoc */) {
     char destMac[18];
     snprintf(destMac, sizeof(destMac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -360,6 +406,7 @@ void IRAM_ATTR wifiSniffCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
   bool isBeacon = (fcSubtype == 0x08);
   bool isProbeReq = (fcSubtype == 0x04);
   if (!isBeacon && !isProbeReq) return;
+  if (!sniffShouldEmit(&payload[10], isBeacon ? 1 : 2)) return;
 
   // Beacons carry 12 bytes of fixed fields before tagged params; probe
   // requests have no fixed fields, tags start right after the 24-byte header.
@@ -425,8 +472,16 @@ void wifiTask(void *arg) {
 // ------------------------------------------------------------------------
 // BLE passive scan (also core 0 - shares the wifiTask's core, never core 1)
 // ------------------------------------------------------------------------
+static bool bleInitialized = false;
+
 void doBleScan(int seconds) {
-  NimBLEDevice::init("");
+  // NimBLEDevice::init() is meant to run once per boot - re-initializing the
+  // BLE stack on every BLE_SCAN call (the previous behavior) is a known
+  // anti-pattern that left the scan hanging with no reply on later calls.
+  if (!bleInitialized) {
+    NimBLEDevice::init("");
+    bleInitialized = true;
+  }
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(false); // passive: don't send scan-request frames
   NimBLEScanResults results = scan->start(seconds, false);
