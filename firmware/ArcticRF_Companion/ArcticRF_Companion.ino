@@ -97,6 +97,19 @@
 const int AUX_GPIO_PINS[] = {4, 16, 17, 25, 26, 27};
 const int AUX_GPIO_COUNT = sizeof(AUX_GPIO_PINS) / sizeof(AUX_GPIO_PINS[0]);
 
+// Declared this early (rather than next to identifyFixedCodeProtocol() below,
+// where it's used) because Arduino's sketch preprocessor inserts generated
+// function prototypes near the top of the file, before any type it doesn't
+// already know about - a struct defined further down than that insertion
+// point makes the generated prototype fail to compile with "does not name a
+// type" even though the real function definition is fine.
+struct DecodedProtocol {
+  bool found;
+  const char *name;
+  uint32_t code;
+  int bits;
+};
+
 // ------------------------------------------------------------------------
 // Raw sub-GHz capture/replay tuning
 // ------------------------------------------------------------------------
@@ -226,6 +239,63 @@ void cc1101TransmitRaw(const uint16_t *pulses, int count) {
 }
 
 // ------------------------------------------------------------------------
+// Sub-GHz fixed-code protocol identification (PT2262/EV1527-style)
+// ------------------------------------------------------------------------
+// Best-effort, rc-switch-style heuristic: scans the raw edge-duration
+// buffer for a repeating "sync gap + 24 data bits" pattern. These remotes
+// (garage doors, gate openers, doorbells, sensors) encode each bit as a
+// short/long pulse-width pair and repeat the same code several times while
+// the button is held - we require the code to repeat cleanly at least once
+// before reporting a decode, the same confirmation rc-switch itself uses
+// to reject noise. This is identification only, not a new capture path -
+// RF_LISTEN/RF_TRANSMIT still work on the raw pulses regardless of whether
+// a protocol is recognized.
+DecodedProtocol identifyFixedCodeProtocol(volatile uint16_t *pulses, int n) {
+  DecodedProtocol result = { false, "", 0, 0 };
+  const int candidateUnits[] = { 150, 200, 250, 300, 350, 400, 450, 500, 600 };
+
+  for (unsigned u = 0; u < sizeof(candidateUnits) / sizeof(candidateUnits[0]); u++) {
+    int unit = candidateUnits[u];
+    int tol = unit / 2;
+    int syncMin = unit * 20, syncMax = unit * 45;
+
+    for (int i = 0; i + 1 < n; i++) {
+      if (abs((int)pulses[i] - unit) > tol) continue;
+      if ((int)pulses[i + 1] < syncMin || (int)pulses[i + 1] > syncMax) continue;
+
+      int p = i + 2;
+      uint32_t code = 0;
+      int bitsDecoded = 0;
+      bool ok = true;
+      while (bitsDecoded < 24 && p + 1 < n) {
+        int a = pulses[p], b = pulses[p + 1];
+        bool isZero = (abs(a - unit) <= tol) && (abs(b - unit * 3) <= tol * 2);
+        bool isOne = (abs(a - unit * 3) <= tol * 2) && (abs(b - unit) <= tol);
+        if (isZero) code = (code << 1);
+        else if (isOne) code = (code << 1) | 1;
+        else { ok = false; break; }
+        bitsDecoded++;
+        p += 2;
+      }
+      if (!ok || bitsDecoded != 24) continue;
+
+      // Confirm with a second sync marker right after (the remote
+      // repeating itself) before trusting the decode.
+      if (p + 1 < n &&
+          abs((int)pulses[p] - unit) <= tol &&
+          (int)pulses[p + 1] >= syncMin && (int)pulses[p + 1] <= syncMax) {
+        result.found = true;
+        result.name = "EV1527/PT2262-style fixed code";
+        result.code = code;
+        result.bits = 24;
+        return result;
+      }
+    }
+  }
+  return result;
+}
+
+// ------------------------------------------------------------------------
 // RF task (core 1) - owns RF_LISTEN state machine so a slow capture never
 // blocks the serial command loop.
 // ------------------------------------------------------------------------
@@ -266,9 +336,13 @@ void rfTask(void *arg) {
         if (i) csv += ',';
         csv += rfPulses[i];
       }
+      DecodedProtocol proto = identifyFixedCodeProtocol(rfPulses, n);
       String out = "{\"freq\":" + String(ELECHOUSE_cc1101.getMHZ(), 2) +
-                   ",\"protocol\":\"RAW_OOK\",\"count\":" + String(n) +
-                   ",\"csv\":\"" + csv + "\"}";
+                   ",\"protocol\":\"" + (proto.found ? String(proto.name) : String("RAW_OOK")) + "\"";
+      if (proto.found) {
+        out += ",\"code\":\"0x" + String(proto.code, HEX) + "\",\"bits\":" + String(proto.bits);
+      }
+      out += ",\"count\":" + String(n) + ",\"csv\":\"" + csv + "\"}";
       printLine("RF_CAPTURE " + out);
     }
   }
@@ -321,6 +395,26 @@ void doWifiScan() {
     o["channel"] = WiFi.channel(i);
     o["encryption"] = encTypeToString(WiFi.encryptionType(i));
   }
+
+  // Evil-twin / rogue-AP heuristic: the same SSID broadcast from two
+  // different BSSIDs with two different encryption types is the classic
+  // signature of a rogue clone impersonating a real network at weaker
+  // security (e.g. a fake "OPEN" copy of a WPA2 AP). Flag-only - we never
+  // act on it, just surface it to the user.
+  for (int i = 0; i < n; i++) {
+    String ssidI = WiFi.SSID(i);
+    if (ssidI.length() == 0) continue;
+    for (int j = i + 1; j < n; j++) {
+      if (WiFi.SSID(j) != ssidI) continue;
+      if (WiFi.BSSIDstr(j) == WiFi.BSSIDstr(i)) continue;
+      if (WiFi.encryptionType(j) == WiFi.encryptionType(i)) continue;
+      arr[i]["suspicious"] = true;
+      arr[i]["suspiciousReason"] = "same SSID, mismatched security vs another AP";
+      arr[j]["suspicious"] = true;
+      arr[j]["suspiciousReason"] = "same SSID, mismatched security vs another AP";
+    }
+  }
+
   String out;
   serializeJson(doc, out);
   printLine("WIFI_SCAN_RESULT " + out);
@@ -474,6 +568,19 @@ void wifiTask(void *arg) {
 // ------------------------------------------------------------------------
 static bool bleInitialized = false;
 
+// Flags well-known Bluetooth LE tracker advertisement signatures (anti-
+// stalking awareness, not exploitation - this only reads what the tracker
+// is already broadcasting to everyone). Company IDs are from the Bluetooth
+// SIG's public assigned-numbers list.
+String classifyBleTracker(const std::string &md) {
+  if (md.size() >= 3) {
+    uint8_t b0 = (uint8_t)md[0], b1 = (uint8_t)md[1], b2 = (uint8_t)md[2];
+    if (b0 == 0x4C && b1 == 0x00 && b2 == 0x12) return "AirTag / Find My";
+    if (b0 == 0xCD && b1 == 0x00) return "Tile";
+  }
+  return "";
+}
+
 void doBleScan(int seconds) {
   // NimBLEDevice::init() is meant to run once per boot - re-initializing the
   // BLE stack on every BLE_SCAN call (the previous behavior) is a known
@@ -506,6 +613,11 @@ void doBleScan(int seconds) {
         hex += b;
       }
       o["mfgData"] = hex;
+      String trackerType = classifyBleTracker(md);
+      if (trackerType.length()) {
+        o["tracker"] = true;
+        o["trackerType"] = trackerType;
+      }
     }
   }
   String out;
