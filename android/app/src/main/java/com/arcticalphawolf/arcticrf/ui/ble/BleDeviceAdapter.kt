@@ -28,6 +28,12 @@ class BleDeviceAdapter : RecyclerView.Adapter<BleDeviceAdapter.ViewHolder>() {
         holder.binding.mac.text = item.mac
         holder.binding.rssi.text = "${item.rssi}dBm"
         holder.binding.mfgData.text = item.mfgData?.let { "mfg: $it" } ?: ""
+        if (item.tracker) {
+            holder.binding.trackerBadge.visibility = android.view.View.VISIBLE
+            holder.binding.trackerBadge.text = "⚠ ${item.trackerType ?: "TRACKER"}"
+        } else {
+            holder.binding.trackerBadge.visibility = android.view.View.GONE
+        }
     }
 
     override fun getItemCount() = items.size

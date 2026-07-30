@@ -6,12 +6,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /** Single point of access for the rest of the app: typed board events out, simple command calls in. */
 class BoardRepository(private val usb: UsbSerialManager, private val scope: CoroutineScope) {
@@ -41,9 +44,21 @@ class BoardRepository(private val usb: UsbSerialManager, private val scope: Coro
     /** rawLines plus connection diagnostics (IO errors, reconnect attempts) - feeds the Console tab. */
     val consoleLines: Flow<String> = merge(rawLines, usb.diagnostics.map { "# $it" })
 
+    private val _firmwareVersion = MutableStateFlow<String?>(null)
+    /** Populated from the board's own VERSION reply - null until one arrives. Powers the Capabilities screen. */
+    val firmwareVersion: StateFlow<String?> = _firmwareVersion.asStateFlow()
+
     init {
         scope.launch {
-            rawLines.map { BoardEventParser.parse(it) }.collect { _events.emit(it) }
+            rawLines.map { BoardEventParser.parse(it) }.collect { event ->
+                if (event is BoardEvent.Version) _firmwareVersion.value = event.version
+                _events.emit(event)
+            }
+        }
+        scope.launch {
+            connectionState.collect { state ->
+                if (state is ConnectionState.Connected) usb.send("VERSION")
+            }
         }
     }
 
@@ -92,4 +107,14 @@ class BoardRepository(private val usb: UsbSerialManager, private val scope: Coro
 
     fun gpioSet(pin: Int, high: Boolean) = usb.send("GPIO_SET $pin ${if (high) 1 else 0}")
     fun gpioGet(pin: Int) = usb.send("GPIO_GET $pin")
+
+    /** Tells the board to join [ssid] just long enough to pull [url] and flash itself - no PC needed. */
+    fun otaStart(ssid: String, password: String, url: String) {
+        val json = JSONObject().apply {
+            put("ssid", ssid)
+            put("password", password)
+            put("url", url)
+        }
+        usb.send("OTA_START $json")
+    }
 }

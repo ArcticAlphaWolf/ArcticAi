@@ -36,6 +36,12 @@
                 android:resource="@xml/device_filter" />
         </activity>
 
+        <activity
+            android:name=".ui.capabilities.CapabilitiesActivity"
+            android:exported="false"
+            android:label="Capabilities &amp; Updates"
+            android:parentActivityName=".MainActivity" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

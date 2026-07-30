@@ -28,6 +28,12 @@ class WifiNetworkAdapter : RecyclerView.Adapter<WifiNetworkAdapter.ViewHolder>()
         holder.binding.bssid.text = "${item.bssid} · ch ${item.channel}"
         holder.binding.rssi.text = "${item.rssi}dBm"
         holder.binding.encryptionBadge.text = item.encryption
+        if (item.suspicious) {
+            holder.binding.suspiciousBadge.visibility = android.view.View.VISIBLE
+            holder.binding.suspiciousBadge.text = "⚠ possible rogue AP - ${item.suspiciousReason ?: "duplicate SSID"}"
+        } else {
+            holder.binding.suspiciousBadge.visibility = android.view.View.GONE
+        }
     }
 
     override fun getItemCount() = items.size

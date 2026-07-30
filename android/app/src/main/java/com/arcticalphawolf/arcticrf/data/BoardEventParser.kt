@@ -22,7 +22,9 @@ object BoardEventParser {
                         freqMhz = o.optDouble("freq", 433.92),
                         protocol = o.optString("protocol", "RAW_OOK"),
                         count = o.optInt("count", 0),
-                        csv = o.optString("csv", "")
+                        csv = o.optString("csv", ""),
+                        decodedCode = if (o.has("code")) o.optString("code") else null,
+                        decodedBits = if (o.has("bits")) o.optInt("bits") else null
                     )
                 }
                 "WIFI_SCAN_RESULT" -> {
@@ -34,7 +36,9 @@ object BoardEventParser {
                             bssid = o.optString("bssid"),
                             rssi = o.optInt("rssi"),
                             channel = o.optInt("channel"),
-                            encryption = o.optString("encryption")
+                            encryption = o.optString("encryption"),
+                            suspicious = o.optBoolean("suspicious", false),
+                            suspiciousReason = if (o.has("suspiciousReason")) o.optString("suspiciousReason") else null
                         )
                     }
                     BoardEvent.WifiScanResult(list)
@@ -72,7 +76,9 @@ object BoardEventParser {
                             mac = o.optString("mac"),
                             name = o.optString("name"),
                             rssi = o.optInt("rssi"),
-                            mfgData = o.optString("mfgData", "").ifEmpty { null }
+                            mfgData = o.optString("mfgData", "").ifEmpty { null },
+                            tracker = o.optBoolean("tracker", false),
+                            trackerType = if (o.has("trackerType")) o.optString("trackerType") else null
                         )
                     }
                     BoardEvent.BleScanResult(list)
@@ -81,6 +87,10 @@ object BoardEventParser {
                     val o = JSONObject(rest)
                     BoardEvent.GpioValue(o.optInt("pin"), o.optInt("value"))
                 }
+                "OTA_STATUS" -> BoardEvent.OtaStatus(JSONObject(rest).optString("state"))
+                "OTA_PROGRESS" -> BoardEvent.OtaProgress(JSONObject(rest).optInt("percent"))
+                "OTA_OK" -> BoardEvent.OtaOk
+                "OTA_FAIL" -> BoardEvent.OtaFail(JSONObject(rest).optString("reason", "unknown error"))
                 "OK" -> BoardEvent.Ack(rest)
                 "ERR" -> BoardEvent.Err(rest)
                 else -> BoardEvent.Unknown(line)

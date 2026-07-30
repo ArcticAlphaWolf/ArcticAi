@@ -85,6 +85,13 @@ class SubGhzFragment : Fragment() {
                 launch {
                     viewModel.pendingCapture.collect { capture ->
                         if (capture != null) {
+                            if (capture.protocol != "RAW_OOK") {
+                                Toast.makeText(
+                                    context,
+                                    "Decoded: ${capture.protocol}${capture.decodedCode?.let { " ($it)" } ?: ""}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
                             AddDeviceDialogFragment { name, iconKey -> viewModel.saveCapture(name, iconKey) }
                                 .show(childFragmentManager, "add_device")
                             viewModel.dismissCapture()

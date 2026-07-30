@@ -11,6 +11,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.arcticalphawolf.arcticrf.databinding.ActivityMainBinding
 import com.arcticalphawolf.arcticrf.ui.ble.BleFragment
+import com.arcticalphawolf.arcticrf.ui.capabilities.CapabilitiesActivity
 import com.arcticalphawolf.arcticrf.ui.console.ConsoleFragment
 import com.arcticalphawolf.arcticrf.ui.gpio.GpioFragment
 import com.arcticalphawolf.arcticrf.ui.subghz.SubGhzFragment
@@ -47,6 +48,10 @@ class MainActivity : AppCompatActivity() {
                 .replace(binding.navHostFragment.id, fragment)
                 .commit()
             true
+        }
+
+        binding.btnCapabilities.setOnClickListener {
+            startActivity(Intent(this, CapabilitiesActivity::class.java))
         }
 
         observeConnectionState()

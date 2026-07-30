@@ -33,6 +33,15 @@
             android:text="@string/status_disconnected"
             android:textColor="#FFFFFF"
             android:textSize="14sp" />
+
+        <ImageButton
+            android:id="@+id/btn_capabilities"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Capabilities and updates"
+            android:src="@drawable/ic_capabilities"
+            app:tint="#FFFFFF" />
     </LinearLayout>
 
     <androidx.fragment.app.FragmentContainerView

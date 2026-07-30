@@ -35,6 +35,16 @@
                 android:layout_height="wrap_content"
                 android:textSize="12sp"
                 android:alpha="0.6" />
+
+            <TextView
+                android:id="@+id/suspicious_badge"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textSize="11sp"
+                android:textColor="#FF5252"
+                android:textStyle="bold"
+                android:visibility="gone" />
         </LinearLayout>
 
         <com.google.android.material.chip.Chip

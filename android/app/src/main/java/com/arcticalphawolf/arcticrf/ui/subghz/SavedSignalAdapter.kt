@@ -23,7 +23,11 @@ class SavedSignalAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val item = getItem(position)
         holder.binding.name.text = item.name
-        holder.binding.subtitle.text = "%.2f MHz".format(item.freqMhz)
+        holder.binding.subtitle.text = if (item.protocol != "RAW_OOK") {
+            item.protocol
+        } else {
+            "%.2f MHz".format(item.freqMhz)
+        }
         holder.binding.icon.setImageResource(iconKeyToDrawableRes(item.iconKey))
         holder.binding.itemRoot.setOnClickListener { onClick(item) }
         holder.binding.itemRoot.setOnLongClickListener { onLongClick(item); true }
