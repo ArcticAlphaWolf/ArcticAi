@@ -48,7 +48,12 @@
  *   Tools > Board > Boards Manager > search "esp32" > install.
  *   Tools > Manage Libraries > install the three libraries above.
  *   Tools > Board > "ESP32 Dev Module", Tools > Port > (your CP2102/CH340
- *   port), then Upload.
+ *   port).
+ *   Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP with OTA/128KB
+ *   SPIFFS)" - REQUIRED as of the WiFi-OTA feature below: the default 4MB
+ *   partition table only gives ~1.2MB per app slot, and this sketch (with
+ *   the TLS/HTTP stack the OTA update path needs) no longer fits in that.
+ *   Then Upload.
  *
  * Serial protocol: newline-terminated ASCII commands in, newline-terminated
  * event lines out. Every emitted line starts with an event tag so the phone
@@ -68,6 +73,10 @@
  *   BLE_SCAN [seconds]            -> BLE_SCAN_RESULT [...]
  *   GPIO_SET <pin> <0|1>          -> OK GPIO_SET <pin> <val>
  *   GPIO_GET <pin>                -> GPIO_VALUE {"pin":n,"value":n}
+ *   OTA_START {"ssid":...,"password":...,"url":...}
+ *                                 -> OK OTA_START, then streamed
+ *                                    OTA_STATUS {...} / OTA_PROGRESS {...} /
+ *                                    OTA_OK {} (board reboots) / OTA_FAIL {...}
  *
  * Legal/ethical note: RF_LISTEN/RF_TRANSMIT only replay what you captured
  * yourself - use only on devices/systems you own or are authorized to test.
@@ -84,6 +93,8 @@
 #include <esp_wifi.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
 
 // ------------------------------------------------------------------------
 // Pin map
@@ -353,10 +364,16 @@ void rfTask(void *arg) {
 // Runs entirely on core 0 so its driver callbacks never preempt the RF
 // capture ISR/task pinned to core 1.
 // ------------------------------------------------------------------------
-enum WifiJobType { WIFI_JOB_NONE, WIFI_JOB_SCAN, WIFI_JOB_SNIFF_START, WIFI_JOB_SNIFF_STOP };
+enum WifiJobType { WIFI_JOB_NONE, WIFI_JOB_SCAN, WIFI_JOB_SNIFF_START, WIFI_JOB_SNIFF_STOP, WIFI_JOB_OTA };
 struct WifiJob {
   WifiJobType type;
   int channel;
+  // Only used by WIFI_JOB_OTA. Fixed-size and carried on the queue (rather
+  // than a shared global) so a job already queued can't have its target
+  // network/URL changed out from under it by a second OTA_START command.
+  char otaSsid[64];
+  char otaPassword[64];
+  char otaUrl[192];
 };
 static QueueHandle_t wifiJobQueue;
 static volatile bool wifiSniffing = false;
@@ -539,6 +556,63 @@ void stopWifiSniff() {
   wifiSniffing = false;
 }
 
+// ------------------------------------------------------------------------
+// WiFi OTA firmware update - lets the phone app push a new firmware binary
+// over WiFi so the board never has to go back to a PC for a reflash. Only
+// ever runs when explicitly requested via OTA_START; every other WiFi
+// feature in this firmware (scan/sniff) stays purely passive and never
+// associates with a network on its own.
+// ------------------------------------------------------------------------
+void otaProgressCb(int cur, int total) {
+  int pct = total > 0 ? (cur * 100) / total : 0;
+  printLine("OTA_PROGRESS {\"percent\":" + String(pct) + "}");
+}
+
+void doOtaUpdate(const char *ssid, const char *password, const char *url) {
+  printLine("OTA_STATUS {\"state\":\"connecting\"}");
+  if (wifiSniffing) stopWifiSniff();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > 15000) {
+      printLine("OTA_FAIL {\"reason\":\"WiFi connect timeout\"}");
+      WiFi.disconnect(true);
+      return;
+    }
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+
+  printLine("OTA_STATUS {\"state\":\"downloading\"}");
+  WiFiClientSecure client;
+  // The URL is whatever the user pasted in (e.g. a GitHub Release asset) -
+  // we don't carry a maintained CA bundle for arbitrary hosts on a chip
+  // this memory-constrained, so certificate validation is skipped here.
+  // Treat the URL the same way you'd treat any firmware download link.
+  client.setInsecure();
+
+  httpUpdate.onProgress(otaProgressCb);
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
+
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      printLine("OTA_OK {}");
+      delay(200);
+      ESP.restart();
+      return; // unreachable, but keeps intent obvious
+    case HTTP_UPDATE_NO_UPDATES:
+      printLine("OTA_FAIL {\"reason\":\"no update available at that url\"}");
+      break;
+    case HTTP_UPDATE_FAILED:
+    default:
+      printLine("OTA_FAIL {\"reason\":\"" + String(httpUpdate.getLastErrorString().c_str()) + "\"}");
+      break;
+  }
+  // Only reached on failure - drop the association instead of staying
+  // joined to whatever network was given.
+  WiFi.disconnect(true);
+}
+
 void wifiTask(void *arg) {
   WifiJob job;
   for (;;) {
@@ -556,6 +630,9 @@ void wifiTask(void *arg) {
         case WIFI_JOB_SNIFF_STOP:
           stopWifiSniff();
           printLine("OK WIFI_SNIFF_STOP");
+          break;
+        case WIFI_JOB_OTA:
+          doOtaUpdate(job.otaSsid, job.otaPassword, job.otaUrl);
           break;
         default: break;
       }
@@ -653,7 +730,7 @@ void handleCommand(const String &lineIn) {
   } else if (cmd == "VERSION") {
     printLine("VERSION ArcticRF-1.0");
   } else if (cmd == "HELP") {
-    printLine("HELP PING,VERSION,FREQ,RF_LISTEN,RF_STOP,RF_TRANSMIT,WIFI_SCAN,WIFI_SNIFF,WIFI_SNIFF_STOP,BLE_SCAN,GPIO_SET,GPIO_GET");
+    printLine("HELP PING,VERSION,FREQ,RF_LISTEN,RF_STOP,RF_TRANSMIT,WIFI_SCAN,WIFI_SNIFF,WIFI_SNIFF_STOP,BLE_SCAN,GPIO_SET,GPIO_GET,OTA_START");
   } else if (cmd == "FREQ") {
     float mhz = args.toFloat();
     if (mhz < 1.0) { printLine("ERR FREQ invalid"); return; }
@@ -715,6 +792,26 @@ void handleCommand(const String &lineIn) {
     pinMode(pin, INPUT);
     int val = digitalRead(pin);
     printLine("GPIO_VALUE {\"pin\":" + String(pin) + ",\"value\":" + String(val) + "}");
+  } else if (cmd == "OTA_START") {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, args) != DeserializationError::Ok) {
+      printLine("OTA_FAIL {\"reason\":\"bad request json\"}");
+      return;
+    }
+    const char *ssid = doc["ssid"] | "";
+    const char *pass = doc["password"] | "";
+    const char *url = doc["url"] | "";
+    if (strlen(ssid) == 0 || strlen(url) == 0) {
+      printLine("OTA_FAIL {\"reason\":\"missing ssid or url\"}");
+      return;
+    }
+    WifiJob job{};
+    job.type = WIFI_JOB_OTA;
+    snprintf(job.otaSsid, sizeof(job.otaSsid), "%s", ssid);
+    snprintf(job.otaPassword, sizeof(job.otaPassword), "%s", pass);
+    snprintf(job.otaUrl, sizeof(job.otaUrl), "%s", url);
+    xQueueSend(wifiJobQueue, &job, 0);
+    printLine("OK OTA_START");
   } else {
     printLine("ERR unknown command " + cmd);
   }
