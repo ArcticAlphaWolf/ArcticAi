@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/nav_subghz" android:title="@string/nav_subghz" android:icon="@drawable/ic_nav_subghz" />
+    <item android:id="@+id/nav_wifi" android:title="@string/nav_wifi" android:icon="@drawable/ic_nav_wifi" />
+    <item android:id="@+id/nav_ble" android:title="@string/nav_ble" android:icon="@drawable/ic_nav_ble" />
+    <item android:id="@+id/nav_gpio" android:title="@string/nav_gpio" android:icon="@drawable/ic_nav_gpio" />
+    <item android:id="@+id/nav_console" android:title="@string/nav_console" android:icon="@drawable/ic_nav_console" />
+</menu>

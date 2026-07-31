@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  USB VID/PID pairs for the two USB-UART bridge chips most ESP32 DevKit
+  boards ship with. Android matches an attached USB device against this
+  filter to decide whether to offer "Open with Arctic RF" the instant the
+  board is plugged in over OTG - this is what makes auto-launch work
+  without the user ever having to find the app manually.
+
+  - CP2102 (Silicon Labs): VID 0x10C4 (4292) / PID 0xEA60 (60000)
+  - CH340  (WCH):          VID 0x1A86 (6790) / PID 0x7523 (29987)
+  - CH9102 (WCH, newer):   VID 0x1A86 (6790) / PID 0x55D4 (21972)
+    (bundled here too since some newer ESP32 DevKit revisions use it)
+-->
+<resources>
+    <usb-device vendor-id="4292" product-id="60000" />
+    <usb-device vendor-id="6790" product-id="29987" />
+    <usb-device vendor-id="6790" product-id="21972" />
+</resources>

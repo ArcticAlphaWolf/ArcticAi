@@ -1,0 +1,864 @@
+/*
+ * Arctic RF Companion - ESP32 firmware
+ * -------------------------------------------------------------------------
+ * USB-serial command bridge (115200 8N1) that exposes:
+ *   - CC1101 433.92MHz sub-GHz raw signal capture/replay
+ *   - Native ESP32 Wi-Fi passive AP scan + promiscuous beacon/probe sniff
+ *     (+ passive deauth/disassoc intrusion alerting, transmit nothing)
+ *   - Native ESP32 BLE passive advertisement scan
+ *   - A handful of general-purpose GPIO pins ("aux" I/O, Flipper GPIO-app
+ *     style)
+ *
+ * Board used for this project: a bare ESP32-WROOM-32 DevKit + a CC1101
+ * breakout, bridged to the phone through the DevKit's on-board USB-UART
+ * chip. Two common DevKit variants exist - pick the one that matches your
+ * board silkscreen, both are supported by usb-serial-for-android on the
+ * Android side without any driver install:
+ *   - CP2102  (Silicon Labs)  USB VID 0x10C4 / PID 0xEA60
+ *   - CH340   (WCH)           USB VID 0x1A86 / PID 0x7523
+ *
+ * Wiring (CC1101 breakout -> ESP32):
+ *   VCC  -> 3V3      (CC1101 is NOT 5V tolerant)
+ *   GND  -> GND
+ *   MOSI -> GPIO23
+ *   MISO -> GPIO19
+ *   SCK  -> GPIO18
+ *   CSN  -> GPIO5
+ *   GDO0 -> GPIO2
+ *   GDO2 -> not connected (unused)
+ *
+ * Optional "aux" GPIO header for the GPIO tab (avoid the SPI/strapping/
+ * flash pins): GPIO4, GPIO16, GPIO17, GPIO25, GPIO26, GPIO27.
+ *
+ * Required libraries (Arduino IDE Library Manager, or PlatformIO):
+ *   1. "SmartRC-CC1101-Driver-Lib" by Little Satan / Air-Master
+ *      (https://github.com/LSatan/SmartRC-CC1101-Driver-Lib) - install via
+ *      Library Manager search "SmartRC-CC1101". Provides the
+ *      ELECHOUSE_cc1101 driver object used below.
+ *   2. "NimBLE-Arduino" by h2zero, version ^1.4.1 - lightweight BLE stack,
+ *      much smaller RAM/flash footprint than the stock Bluedroid stack and
+ *      coexists with Wi-Fi far more reliably.
+ *   3. "ArduinoJson" by Benoit Blanchon, version ^6.21 (v6 API used below).
+ *   4. ESP32 board package ("esp32" by Espressif Systems) >= 2.0.x installed
+ *      via Boards Manager (Board: "ESP32 Dev Module").
+ *
+ * Install steps (Arduino IDE):
+ *   File > Preferences > Additional Board Manager URLs, add:
+ *     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+ *   Tools > Board > Boards Manager > search "esp32" > install.
+ *   Tools > Manage Libraries > install the three libraries above.
+ *   Tools > Board > "ESP32 Dev Module", Tools > Port > (your CP2102/CH340
+ *   port).
+ *   Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP with OTA/128KB
+ *   SPIFFS)" - REQUIRED as of the WiFi-OTA feature below: the default 4MB
+ *   partition table only gives ~1.2MB per app slot, and this sketch (with
+ *   the TLS/HTTP stack the OTA update path needs) no longer fits in that.
+ *   Then Upload.
+ *
+ * Serial protocol: newline-terminated ASCII commands in, newline-terminated
+ * event lines out. Every emitted line starts with an event tag so the phone
+ * app can dispatch on it without a full parser:
+ *
+ *   PING                          -> PONG
+ *   VERSION                       -> VERSION ArcticRF-1.0
+ *   HELP                          -> HELP <comma list of commands>
+ *   FREQ <mhz>                    -> OK FREQ <mhz>            (e.g. FREQ 433.92)
+ *   RF_LISTEN [timeout_ms]        -> RF_CAPTURE {...}  or  RF_TIMEOUT
+ *   RF_STOP                       -> OK RF_STOP
+ *   RF_TRANSMIT <csv_of_us>       -> OK RF_TRANSMIT
+ *   WIFI_SCAN                     -> WIFI_SCAN_RESULT [...]
+ *   WIFI_SNIFF <channel>          -> OK WIFI_SNIFF, then streamed
+ *                                     WIFI_SNIFF_DATA {...} / WIFI_ALERT {...}
+ *   WIFI_SNIFF_STOP               -> OK WIFI_SNIFF_STOP
+ *   BLE_SCAN [seconds]            -> BLE_SCAN_RESULT [...]
+ *   GPIO_SET <pin> <0|1>          -> OK GPIO_SET <pin> <val>
+ *   GPIO_GET <pin>                -> GPIO_VALUE {"pin":n,"value":n}
+ *   OTA_START {"ssid":...,"password":...,"url":...}
+ *                                 -> OK OTA_START, then streamed
+ *                                    OTA_STATUS {...} / OTA_PROGRESS {...} /
+ *                                    OTA_OK {} (board reboots) / OTA_FAIL {...}
+ *
+ * Legal/ethical note: RF_LISTEN/RF_TRANSMIT only replay what you captured
+ * yourself - use only on devices/systems you own or are authorized to test.
+ * Modern rolling-code garage/gate/car remotes are specifically designed to
+ * defeat replay and will not work with this (or any) simple capture/replay
+ * tool. Wi-Fi/BLE features here are receive-only: no deauth, no injection,
+ * no jamming is implemented anywhere in this firmware.
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <NimBLEDevice.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
+
+// ------------------------------------------------------------------------
+// Pin map
+// ------------------------------------------------------------------------
+#define PIN_MOSI 23
+#define PIN_MISO 19
+#define PIN_SCK  18
+#define PIN_CSN  5
+#define PIN_GDO0 2
+
+const int AUX_GPIO_PINS[] = {4, 16, 17, 25, 26, 27};
+const int AUX_GPIO_COUNT = sizeof(AUX_GPIO_PINS) / sizeof(AUX_GPIO_PINS[0]);
+
+// Declared this early (rather than next to identifyFixedCodeProtocol() below,
+// where it's used) because Arduino's sketch preprocessor inserts generated
+// function prototypes near the top of the file, before any type it doesn't
+// already know about - a struct defined further down than that insertion
+// point makes the generated prototype fail to compile with "does not name a
+// type" even though the real function definition is fine.
+struct DecodedProtocol {
+  bool found;
+  const char *name;
+  uint32_t code;
+  int bits;
+};
+
+// ------------------------------------------------------------------------
+// Raw sub-GHz capture/replay tuning
+// ------------------------------------------------------------------------
+#define RF_MAX_PULSES        800     // pulse-edge buffer depth
+#define RF_MIN_PULSE_US       80     // ignore edges shorter than this (noise)
+#define RF_MAX_PULSE_US    12000     // pulse longer than this ends the frame
+#define RF_IDLE_TIMEOUT_US 15000     // no edges for this long -> capture done
+#define RF_DEFAULT_TIMEOUT_MS 10000  // RF_LISTEN default abort timeout
+
+// ------------------------------------------------------------------------
+// Concurrency primitives
+// ------------------------------------------------------------------------
+// CC1101 SPI register access and the ESP32 Wi-Fi/BLE radio both eventually
+// touch shared resources (SPI bus, and the single 2.4GHz/RF front-end on
+// classic ESP32 shares timing-sensitive interrupt latency with anything on
+// core 1). We pin all CC1101 timing-critical work to core 1 and all Wi-Fi
+// work to core 0, and we guard every CC1101 driver call with a mutex so a
+// Wi-Fi-triggered command handler running on core 0 can never interleave a
+// SPI transaction with the RF task's interrupt-driven capture on core 1.
+static SemaphoreHandle_t spiMutex;
+static SemaphoreHandle_t serialMutex;
+
+static void printLine(const String &line) {
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.println(line);
+  xSemaphoreGive(serialMutex);
+}
+
+// ------------------------------------------------------------------------
+// Raw pulse capture (ISR-driven, rc-switch style)
+// ------------------------------------------------------------------------
+volatile uint16_t rfPulses[RF_MAX_PULSES];
+volatile int rfPulseCount = 0;
+volatile uint32_t rfLastEdgeUs = 0;
+volatile bool rfCaptureArmed = false;
+volatile bool rfCaptureDone = false;
+
+void IRAM_ATTR rfEdgeIsr() {
+  if (!rfCaptureArmed) return;
+  uint32_t now = micros();
+  uint32_t delta = now - rfLastEdgeUs;
+  rfLastEdgeUs = now;
+
+  if (delta < RF_MIN_PULSE_US) return; // debounce / demod noise
+
+  if (delta > RF_MAX_PULSE_US) {
+    // Long gap: treat as a frame boundary. If we already have pulses,
+    // this ends the capture; otherwise it's just idle carrier noise.
+    if (rfPulseCount > 8) {
+      rfCaptureArmed = false;
+      rfCaptureDone = true;
+    }
+    return;
+  }
+
+  if (rfPulseCount < RF_MAX_PULSES) {
+    rfPulses[rfPulseCount++] = (uint16_t)delta;
+  } else {
+    rfCaptureArmed = false;
+    rfCaptureDone = true;
+  }
+}
+
+// Puts the CC1101 into a demodulated-bitstream mode where GDO0 toggles in
+// real time with the received OOK/ASK signal (CC1101 "asynchronous serial
+// mode", PKTCTRL0.PKT_FORMAT = 3), instead of trying to decode a specific
+// packet protocol. This is what lets us capture arbitrary fixed-code
+// remotes (gate/garage/doorbell/etc.) without knowing their bit encoding
+// ahead of time - we just record raw high/low durations, like an SDR would.
+void cc1101EnterRawRx() {
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D); // GDO0 = serial data out
+  ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
+  ELECHOUSE_cc1101.setPktFormat(3);    // asynchronous serial mode
+  ELECHOUSE_cc1101.setSyncMode(0);     // no sync word / preamble matching
+  ELECHOUSE_cc1101.setCrc(false);
+  ELECHOUSE_cc1101.setWhiteData(false);
+  ELECHOUSE_cc1101.SetRx();
+  xSemaphoreGive(spiMutex);
+
+  pinMode(PIN_GDO0, INPUT);
+  rfPulseCount = 0;
+  rfCaptureDone = false;
+  rfLastEdgeUs = micros();
+  rfCaptureArmed = true;
+  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), rfEdgeIsr, CHANGE);
+}
+
+void cc1101StopRawRx() {
+  rfCaptureArmed = false;
+  detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  ELECHOUSE_cc1101.setSidle();
+  xSemaphoreGive(spiMutex);
+}
+
+// Bit-bangs GDO0 as a digital output while the CC1101 is in asynchronous
+// serial TX mode, reproducing the exact high/low durations that were
+// recorded during RF_LISTEN. This only works for the same class of fixed-
+// code OOK/ASK remotes RF_LISTEN can capture - it is not a protocol decoder.
+void cc1101TransmitRaw(const uint16_t *pulses, int count) {
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D);
+  ELECHOUSE_cc1101.setModulation(2);
+  ELECHOUSE_cc1101.setPktFormat(3);
+  ELECHOUSE_cc1101.setSyncMode(0);
+  ELECHOUSE_cc1101.setCrc(false);
+  ELECHOUSE_cc1101.setWhiteData(false);
+  ELECHOUSE_cc1101.SetTx();
+  xSemaphoreGive(spiMutex);
+
+  pinMode(PIN_GDO0, OUTPUT);
+  bool level = HIGH;
+  noInterrupts();
+  for (int i = 0; i < count; i++) {
+    digitalWrite(PIN_GDO0, level);
+    delayMicroseconds(pulses[i]);
+    level = !level;
+  }
+  digitalWrite(PIN_GDO0, LOW);
+  interrupts();
+
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  ELECHOUSE_cc1101.setSidle();
+  xSemaphoreGive(spiMutex);
+  pinMode(PIN_GDO0, INPUT);
+}
+
+// ------------------------------------------------------------------------
+// Sub-GHz fixed-code protocol identification (PT2262/EV1527-style)
+// ------------------------------------------------------------------------
+// Best-effort, rc-switch-style heuristic: scans the raw edge-duration
+// buffer for a repeating "sync gap + 24 data bits" pattern. These remotes
+// (garage doors, gate openers, doorbells, sensors) encode each bit as a
+// short/long pulse-width pair and repeat the same code several times while
+// the button is held - we require the code to repeat cleanly at least once
+// before reporting a decode, the same confirmation rc-switch itself uses
+// to reject noise. This is identification only, not a new capture path -
+// RF_LISTEN/RF_TRANSMIT still work on the raw pulses regardless of whether
+// a protocol is recognized.
+DecodedProtocol identifyFixedCodeProtocol(volatile uint16_t *pulses, int n) {
+  DecodedProtocol result = { false, "", 0, 0 };
+  const int candidateUnits[] = { 150, 200, 250, 300, 350, 400, 450, 500, 600 };
+
+  for (unsigned u = 0; u < sizeof(candidateUnits) / sizeof(candidateUnits[0]); u++) {
+    int unit = candidateUnits[u];
+    int tol = unit / 2;
+    int syncMin = unit * 20, syncMax = unit * 45;
+
+    for (int i = 0; i + 1 < n; i++) {
+      if (abs((int)pulses[i] - unit) > tol) continue;
+      if ((int)pulses[i + 1] < syncMin || (int)pulses[i + 1] > syncMax) continue;
+
+      int p = i + 2;
+      uint32_t code = 0;
+      int bitsDecoded = 0;
+      bool ok = true;
+      while (bitsDecoded < 24 && p + 1 < n) {
+        int a = pulses[p], b = pulses[p + 1];
+        bool isZero = (abs(a - unit) <= tol) && (abs(b - unit * 3) <= tol * 2);
+        bool isOne = (abs(a - unit * 3) <= tol * 2) && (abs(b - unit) <= tol);
+        if (isZero) code = (code << 1);
+        else if (isOne) code = (code << 1) | 1;
+        else { ok = false; break; }
+        bitsDecoded++;
+        p += 2;
+      }
+      if (!ok || bitsDecoded != 24) continue;
+
+      // Confirm with a second sync marker right after (the remote
+      // repeating itself) before trusting the decode.
+      if (p + 1 < n &&
+          abs((int)pulses[p] - unit) <= tol &&
+          (int)pulses[p + 1] >= syncMin && (int)pulses[p + 1] <= syncMax) {
+        result.found = true;
+        result.name = "EV1527/PT2262-style fixed code";
+        result.code = code;
+        result.bits = 24;
+        return result;
+      }
+    }
+  }
+  return result;
+}
+
+// ------------------------------------------------------------------------
+// RF task (core 1) - owns RF_LISTEN state machine so a slow capture never
+// blocks the serial command loop.
+// ------------------------------------------------------------------------
+struct RfListenRequest {
+  uint32_t timeoutMs;
+};
+static QueueHandle_t rfListenQueue;
+
+void rfTask(void *arg) {
+  RfListenRequest req;
+  for (;;) {
+    if (xQueueReceive(rfListenQueue, &req, portMAX_DELAY) == pdTRUE) {
+      cc1101EnterRawRx();
+      uint32_t start = millis();
+      bool timedOut = false;
+      while (!rfCaptureDone) {
+        if (millis() - start > req.timeoutMs) { timedOut = true; break; }
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+      }
+      cc1101StopRawRx();
+
+      if (timedOut || rfPulseCount < 8) {
+        printLine("RF_TIMEOUT");
+        continue;
+      }
+
+      // Hand-built instead of ArduinoJson: a 4096-byte StaticJsonDocument as
+      // a local here would reserve its whole frame on rfTask's own 4096-byte
+      // stack the instant rfTask is entered (C++ sizes a function's stack
+      // frame for all its locals up front, not lazily per branch) - an
+      // immediate, guaranteed stack overflow into adjacent heap memory. The
+      // app only ever reads freq/protocol/count/csv, so there's no need for
+      // a JSON array here either.
+      int n = rfPulseCount;
+      String csv;
+      csv.reserve(n * 6);
+      for (int i = 0; i < n; i++) {
+        if (i) csv += ',';
+        csv += rfPulses[i];
+      }
+      DecodedProtocol proto = identifyFixedCodeProtocol(rfPulses, n);
+      String out = "{\"freq\":" + String(ELECHOUSE_cc1101.getMHZ(), 2) +
+                   ",\"protocol\":\"" + (proto.found ? String(proto.name) : String("RAW_OOK")) + "\"";
+      if (proto.found) {
+        out += ",\"code\":\"0x" + String(proto.code, HEX) + "\",\"bits\":" + String(proto.bits);
+      }
+      out += ",\"count\":" + String(n) + ",\"csv\":\"" + csv + "\"}";
+      printLine("RF_CAPTURE " + out);
+    }
+  }
+}
+
+// ------------------------------------------------------------------------
+// Wi-Fi task (core 0) - passive scan, promiscuous sniff, deauth alerting.
+// Runs entirely on core 0 so its driver callbacks never preempt the RF
+// capture ISR/task pinned to core 1.
+// ------------------------------------------------------------------------
+enum WifiJobType { WIFI_JOB_NONE, WIFI_JOB_SCAN, WIFI_JOB_SNIFF_START, WIFI_JOB_SNIFF_STOP, WIFI_JOB_OTA };
+struct WifiJob {
+  WifiJobType type;
+  int channel;
+  // Only used by WIFI_JOB_OTA. Fixed-size and carried on the queue (rather
+  // than a shared global) so a job already queued can't have its target
+  // network/URL changed out from under it by a second OTA_START command.
+  char otaSsid[64];
+  char otaPassword[64];
+  char otaUrl[192];
+};
+static QueueHandle_t wifiJobQueue;
+static volatile bool wifiSniffing = false;
+
+String encTypeToString(wifi_auth_mode_t enc) {
+  switch (enc) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA_PSK";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2_PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA_WPA2_PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2_WPA3_PSK";
+    default: return "UNKNOWN";
+  }
+}
+
+void doWifiScan() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(50);
+  // passive=true: we only listen for beacons, we never actively probe.
+  int n = WiFi.scanNetworks(false, false, true, 250);
+  // Heap-backed (not a stack-local StaticJsonDocument): an 8192-byte fixed
+  // buffer as a local here would reserve its whole frame on wifiTask's own
+  // 8192-byte stack on entry, overflowing it into adjacent heap memory
+  // before a single network is even added.
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["ssid"] = WiFi.SSID(i);
+    o["bssid"] = WiFi.BSSIDstr(i);
+    o["rssi"] = WiFi.RSSI(i);
+    o["channel"] = WiFi.channel(i);
+    o["encryption"] = encTypeToString(WiFi.encryptionType(i));
+  }
+
+  // Evil-twin / rogue-AP heuristic: the same SSID broadcast from two
+  // different BSSIDs with two different encryption types is the classic
+  // signature of a rogue clone impersonating a real network at weaker
+  // security (e.g. a fake "OPEN" copy of a WPA2 AP). Flag-only - we never
+  // act on it, just surface it to the user.
+  for (int i = 0; i < n; i++) {
+    String ssidI = WiFi.SSID(i);
+    if (ssidI.length() == 0) continue;
+    for (int j = i + 1; j < n; j++) {
+      if (WiFi.SSID(j) != ssidI) continue;
+      if (WiFi.BSSIDstr(j) == WiFi.BSSIDstr(i)) continue;
+      if (WiFi.encryptionType(j) == WiFi.encryptionType(i)) continue;
+      arr[i]["suspicious"] = true;
+      arr[i]["suspiciousReason"] = "same SSID, mismatched security vs another AP";
+      arr[j]["suspicious"] = true;
+      arr[j]["suspiciousReason"] = "same SSID, mismatched security vs another AP";
+    }
+  }
+
+  String out;
+  serializeJson(doc, out);
+  printLine("WIFI_SCAN_RESULT " + out);
+  WiFi.scanDelete();
+}
+
+// Beacon/probe dedup + rate-limit: a dense real-world WiFi environment emits
+// the same beacons every ~100ms from every nearby AP plus a probe request
+// per nearby client, and each hit here was doing a blocking mutex-guarded
+// Serial.println() - against Espressif's own guidance against lengthy work
+// in the promiscuous callback, and enough sustained volume to overwhelm the
+// phone-side RecyclerView/JSON pipeline. This drops repeat sightings of the
+// same MAC+frame-type within a short window and enforces a hard minimum
+// gap between any two emitted lines as a safety floor.
+#define SNIFF_DEDUP_SIZE 24
+#define SNIFF_DEDUP_WINDOW_MS 3000
+#define SNIFF_MIN_EMIT_GAP_MS 15
+struct SniffSeen { uint8_t mac[6]; uint8_t type; uint32_t lastMs; };
+static SniffSeen sniffSeen[SNIFF_DEDUP_SIZE];
+static int sniffSeenCount = 0;
+static uint32_t lastSniffEmitMs = 0;
+
+static bool sniffShouldEmit(const uint8_t *mac, uint8_t type) {
+  uint32_t now = millis();
+  if (now - lastSniffEmitMs < SNIFF_MIN_EMIT_GAP_MS) return false;
+
+  for (int i = 0; i < sniffSeenCount; i++) {
+    if (sniffSeen[i].type == type && memcmp(sniffSeen[i].mac, mac, 6) == 0) {
+      if (now - sniffSeen[i].lastMs < SNIFF_DEDUP_WINDOW_MS) return false;
+      sniffSeen[i].lastMs = now;
+      lastSniffEmitMs = now;
+      return true;
+    }
+  }
+
+  int slot;
+  if (sniffSeenCount < SNIFF_DEDUP_SIZE) {
+    slot = sniffSeenCount++;
+  } else {
+    slot = 0;
+    for (int i = 1; i < SNIFF_DEDUP_SIZE; i++) {
+      if (sniffSeen[i].lastMs < sniffSeen[slot].lastMs) slot = i;
+    }
+  }
+  memcpy(sniffSeen[slot].mac, mac, 6);
+  sniffSeen[slot].type = type;
+  sniffSeen[slot].lastMs = now;
+  lastSniffEmitMs = now;
+  return true;
+}
+
+// Minimal 802.11 management-frame parser: pulls the SSID tag and reports
+// beacon / probe-request metadata, and separately raises an alert on
+// deauth/disassoc frames (passive intrusion-detection signal only - this
+// firmware never transmits a deauth/disassoc frame itself).
+void IRAM_ATTR wifiSniffCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+  uint8_t *payload = pkt->payload;
+  int rssi = pkt->rx_ctrl.rssi;
+  int channel = pkt->rx_ctrl.channel;
+
+  uint8_t fcSubtype = (payload[0] >> 4) & 0x0F;
+  char srcMac[18];
+  snprintf(srcMac, sizeof(srcMac), "%02X:%02X:%02X:%02X:%02X:%02X",
+           payload[10], payload[11], payload[12], payload[13], payload[14], payload[15]);
+
+  // Deauth/disassoc alerts are rare and security-relevant - never dedup those.
+  if (fcSubtype == 0x0C /* deauth */ || fcSubtype == 0x0A /* disassoc */) {
+    char destMac[18];
+    snprintf(destMac, sizeof(destMac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             payload[4], payload[5], payload[6], payload[7], payload[8], payload[9]);
+    uint16_t reason = payload[24] | (payload[25] << 8);
+    String msg = "WIFI_ALERT {\"kind\":\"";
+    msg += (fcSubtype == 0x0C) ? "deauth" : "disassoc";
+    msg += "\",\"src\":\"" + String(srcMac) + "\",\"dst\":\"" + String(destMac) +
+           "\",\"reason\":" + String(reason) + ",\"channel\":" + String(channel) +
+           ",\"rssi\":" + String(rssi) + "}";
+    printLine(msg);
+    return;
+  }
+
+  bool isBeacon = (fcSubtype == 0x08);
+  bool isProbeReq = (fcSubtype == 0x04);
+  if (!isBeacon && !isProbeReq) return;
+  if (!sniffShouldEmit(&payload[10], isBeacon ? 1 : 2)) return;
+
+  // Beacons carry 12 bytes of fixed fields before tagged params; probe
+  // requests have no fixed fields, tags start right after the 24-byte header.
+  int tagOffset = isBeacon ? (24 + 12) : 24;
+  int len = pkt->rx_ctrl.sig_len;
+  String ssid = "";
+  if (tagOffset + 2 <= len && payload[tagOffset] == 0x00) {
+    int ssidLen = payload[tagOffset + 1];
+    if (ssidLen > 0 && ssidLen <= 32 && tagOffset + 2 + ssidLen <= len) {
+      char buf2[33];
+      memcpy(buf2, &payload[tagOffset + 2], ssidLen);
+      buf2[ssidLen] = 0;
+      ssid = String(buf2);
+    }
+  }
+
+  String msg = "WIFI_SNIFF_DATA {\"type\":\"";
+  msg += isBeacon ? "beacon" : "probe_req";
+  msg += "\",\"ssid\":\"" + ssid + "\",\"mac\":\"" + String(srcMac) +
+         "\",\"rssi\":" + String(rssi) + ",\"channel\":" + String(channel) + "}";
+  printLine(msg);
+}
+
+void startWifiSniff(int channel) {
+  WiFi.mode(WIFI_MODE_STA);
+  esp_wifi_set_promiscuous(true);
+  wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+  esp_wifi_set_promiscuous_filter(&filter);
+  esp_wifi_set_promiscuous_rx_cb(&wifiSniffCallback);
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  wifiSniffing = true;
+}
+
+void stopWifiSniff() {
+  esp_wifi_set_promiscuous(false);
+  wifiSniffing = false;
+}
+
+// ------------------------------------------------------------------------
+// WiFi OTA firmware update - lets the phone app push a new firmware binary
+// over WiFi so the board never has to go back to a PC for a reflash. Only
+// ever runs when explicitly requested via OTA_START; every other WiFi
+// feature in this firmware (scan/sniff) stays purely passive and never
+// associates with a network on its own.
+// ------------------------------------------------------------------------
+void otaProgressCb(int cur, int total) {
+  int pct = total > 0 ? (cur * 100) / total : 0;
+  printLine("OTA_PROGRESS {\"percent\":" + String(pct) + "}");
+}
+
+void doOtaUpdate(const char *ssid, const char *password, const char *url) {
+  printLine("OTA_STATUS {\"state\":\"connecting\"}");
+  if (wifiSniffing) stopWifiSniff();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > 15000) {
+      printLine("OTA_FAIL {\"reason\":\"WiFi connect timeout\"}");
+      WiFi.disconnect(true);
+      return;
+    }
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+
+  printLine("OTA_STATUS {\"state\":\"downloading\"}");
+  WiFiClientSecure client;
+  // The URL is whatever the user pasted in (e.g. a GitHub Release asset) -
+  // we don't carry a maintained CA bundle for arbitrary hosts on a chip
+  // this memory-constrained, so certificate validation is skipped here.
+  // Treat the URL the same way you'd treat any firmware download link.
+  client.setInsecure();
+
+  httpUpdate.onProgress(otaProgressCb);
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
+
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      printLine("OTA_OK {}");
+      delay(200);
+      ESP.restart();
+      return; // unreachable, but keeps intent obvious
+    case HTTP_UPDATE_NO_UPDATES:
+      printLine("OTA_FAIL {\"reason\":\"no update available at that url\"}");
+      break;
+    case HTTP_UPDATE_FAILED:
+    default:
+      printLine("OTA_FAIL {\"reason\":\"" + String(httpUpdate.getLastErrorString().c_str()) + "\"}");
+      break;
+  }
+  // Only reached on failure - drop the association instead of staying
+  // joined to whatever network was given.
+  WiFi.disconnect(true);
+}
+
+void wifiTask(void *arg) {
+  WifiJob job;
+  for (;;) {
+    if (xQueueReceive(wifiJobQueue, &job, portMAX_DELAY) == pdTRUE) {
+      switch (job.type) {
+        case WIFI_JOB_SCAN:
+          if (wifiSniffing) stopWifiSniff();
+          doWifiScan();
+          printLine("OK WIFI_SCAN");
+          break;
+        case WIFI_JOB_SNIFF_START:
+          startWifiSniff(job.channel);
+          printLine("OK WIFI_SNIFF");
+          break;
+        case WIFI_JOB_SNIFF_STOP:
+          stopWifiSniff();
+          printLine("OK WIFI_SNIFF_STOP");
+          break;
+        case WIFI_JOB_OTA:
+          doOtaUpdate(job.otaSsid, job.otaPassword, job.otaUrl);
+          break;
+        default: break;
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------------
+// BLE passive scan (also core 0 - shares the wifiTask's core, never core 1)
+// ------------------------------------------------------------------------
+static bool bleInitialized = false;
+
+// Flags well-known Bluetooth LE tracker advertisement signatures (anti-
+// stalking awareness, not exploitation - this only reads what the tracker
+// is already broadcasting to everyone). Company IDs are from the Bluetooth
+// SIG's public assigned-numbers list.
+String classifyBleTracker(const std::string &md) {
+  if (md.size() >= 3) {
+    uint8_t b0 = (uint8_t)md[0], b1 = (uint8_t)md[1], b2 = (uint8_t)md[2];
+    if (b0 == 0x4C && b1 == 0x00 && b2 == 0x12) return "AirTag / Find My";
+    if (b0 == 0xCD && b1 == 0x00) return "Tile";
+  }
+  return "";
+}
+
+void doBleScan(int seconds) {
+  // NimBLEDevice::init() is meant to run once per boot - re-initializing the
+  // BLE stack on every BLE_SCAN call (the previous behavior) is a known
+  // anti-pattern that left the scan hanging with no reply on later calls.
+  if (!bleInitialized) {
+    NimBLEDevice::init("");
+    bleInitialized = true;
+  }
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setActiveScan(false); // passive: don't send scan-request frames
+  NimBLEScanResults results = scan->start(seconds, false);
+
+  // Heap-backed for the same reason as doWifiScan(): doBleScan() runs
+  // inline on the main loop task, and a stack-local 8192-byte document
+  // would overflow that task's stack the moment this function is entered.
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < results.getCount(); i++) {
+    NimBLEAdvertisedDevice d = results.getDevice(i);
+    JsonObject o = arr.createNestedObject();
+    o["mac"] = d.getAddress().toString();
+    o["name"] = d.haveName() ? d.getName() : "";
+    o["rssi"] = d.getRSSI();
+    if (d.haveManufacturerData()) {
+      std::string md = d.getManufacturerData();
+      String hex;
+      for (size_t j = 0; j < md.size() && j < 16; j++) {
+        char b[3];
+        snprintf(b, sizeof(b), "%02X", (uint8_t)md[j]);
+        hex += b;
+      }
+      o["mfgData"] = hex;
+      String trackerType = classifyBleTracker(md);
+      if (trackerType.length()) {
+        o["tracker"] = true;
+        o["trackerType"] = trackerType;
+      }
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  printLine("BLE_SCAN_RESULT " + out);
+  scan->clearResults();
+}
+
+// ------------------------------------------------------------------------
+// Serial command parsing - stays on core 1 in the main Arduino loop() task.
+// Wi-Fi/BLE jobs are only *enqueued* here, never run inline, so a scan in
+// progress can never delay reading the next byte off the USB CDC port.
+// ------------------------------------------------------------------------
+String serialBuf;
+
+bool pinIsAux(int pin) {
+  for (int i = 0; i < AUX_GPIO_COUNT; i++) if (AUX_GPIO_PINS[i] == pin) return true;
+  return false;
+}
+
+void handleCommand(const String &lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (line.length() == 0) return;
+
+  int sp = line.indexOf(' ');
+  String cmd = (sp == -1) ? line : line.substring(0, sp);
+  String args = (sp == -1) ? "" : line.substring(sp + 1);
+  cmd.toUpperCase();
+
+  if (cmd == "PING") {
+    printLine("PONG");
+  } else if (cmd == "VERSION") {
+    printLine("VERSION ArcticRF-1.0");
+  } else if (cmd == "HELP") {
+    printLine("HELP PING,VERSION,FREQ,RF_LISTEN,RF_STOP,RF_TRANSMIT,WIFI_SCAN,WIFI_SNIFF,WIFI_SNIFF_STOP,BLE_SCAN,GPIO_SET,GPIO_GET,OTA_START");
+  } else if (cmd == "FREQ") {
+    float mhz = args.toFloat();
+    if (mhz < 1.0) { printLine("ERR FREQ invalid"); return; }
+    xSemaphoreTake(spiMutex, portMAX_DELAY);
+    ELECHOUSE_cc1101.setMHZ(mhz);
+    xSemaphoreGive(spiMutex);
+    printLine("OK FREQ " + String(mhz, 2));
+  } else if (cmd == "RF_LISTEN") {
+    RfListenRequest req;
+    req.timeoutMs = args.length() ? (uint32_t)args.toInt() : RF_DEFAULT_TIMEOUT_MS;
+    xQueueSend(rfListenQueue, &req, 0);
+  } else if (cmd == "RF_STOP") {
+    rfCaptureArmed = false;
+    printLine("OK RF_STOP");
+  } else if (cmd == "RF_TRANSMIT") {
+    static uint16_t pulses[RF_MAX_PULSES];
+    int count = 0;
+    int start = 0;
+    while (start < (int)args.length() && count < RF_MAX_PULSES) {
+      int comma = args.indexOf(',', start);
+      String tok = (comma == -1) ? args.substring(start) : args.substring(start, comma);
+      pulses[count++] = (uint16_t)tok.toInt();
+      if (comma == -1) break;
+      start = comma + 1;
+    }
+    if (count < 2) {
+      printLine("ERR RF_TRANSMIT empty payload");
+    } else {
+      cc1101TransmitRaw(pulses, count);
+      printLine("OK RF_TRANSMIT");
+    }
+  } else if (cmd == "WIFI_SCAN") {
+    WifiJob job{WIFI_JOB_SCAN, 0};
+    xQueueSend(wifiJobQueue, &job, 0);
+  } else if (cmd == "WIFI_SNIFF") {
+    int ch = args.length() ? args.toInt() : 1;
+    if (ch < 1 || ch > 14) ch = 1;
+    WifiJob job{WIFI_JOB_SNIFF_START, ch};
+    xQueueSend(wifiJobQueue, &job, 0);
+  } else if (cmd == "WIFI_SNIFF_STOP") {
+    WifiJob job{WIFI_JOB_SNIFF_STOP, 0};
+    xQueueSend(wifiJobQueue, &job, 0);
+  } else if (cmd == "BLE_SCAN") {
+    int secs = args.length() ? args.toInt() : 5;
+    if (secs < 1) secs = 1;
+    if (secs > 30) secs = 30;
+    doBleScan(secs); // short + bounded, fine to run inline
+  } else if (cmd == "GPIO_SET") {
+    int sp2 = args.indexOf(' ');
+    int pin = args.substring(0, sp2).toInt();
+    int val = args.substring(sp2 + 1).toInt();
+    if (!pinIsAux(pin)) { printLine("ERR GPIO_SET reserved pin"); return; }
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, val ? HIGH : LOW);
+    printLine("OK GPIO_SET " + String(pin) + " " + String(val));
+  } else if (cmd == "GPIO_GET") {
+    int pin = args.toInt();
+    if (!pinIsAux(pin)) { printLine("ERR GPIO_GET reserved pin"); return; }
+    pinMode(pin, INPUT);
+    int val = digitalRead(pin);
+    printLine("GPIO_VALUE {\"pin\":" + String(pin) + ",\"value\":" + String(val) + "}");
+  } else if (cmd == "OTA_START") {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, args) != DeserializationError::Ok) {
+      printLine("OTA_FAIL {\"reason\":\"bad request json\"}");
+      return;
+    }
+    const char *ssid = doc["ssid"] | "";
+    const char *pass = doc["password"] | "";
+    const char *url = doc["url"] | "";
+    if (strlen(ssid) == 0 || strlen(url) == 0) {
+      printLine("OTA_FAIL {\"reason\":\"missing ssid or url\"}");
+      return;
+    }
+    WifiJob job{};
+    job.type = WIFI_JOB_OTA;
+    snprintf(job.otaSsid, sizeof(job.otaSsid), "%s", ssid);
+    snprintf(job.otaPassword, sizeof(job.otaPassword), "%s", pass);
+    snprintf(job.otaUrl, sizeof(job.otaUrl), "%s", url);
+    xQueueSend(wifiJobQueue, &job, 0);
+    printLine("OK OTA_START");
+  } else {
+    printLine("ERR unknown command " + cmd);
+  }
+}
+
+// ------------------------------------------------------------------------
+// Setup / loop
+// ------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  serialBuf.reserve(256);
+
+  spiMutex = xSemaphoreCreateMutex();
+  serialMutex = xSemaphoreCreateMutex();
+  rfListenQueue = xQueueCreate(4, sizeof(RfListenRequest));
+  wifiJobQueue = xQueueCreate(4, sizeof(WifiJob));
+
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
+  ELECHOUSE_cc1101.setSpiPin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
+  ELECHOUSE_cc1101.setGDO0(PIN_GDO0);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setMHZ(433.92);
+  ELECHOUSE_cc1101.setPA(10);
+
+  // RF work pinned to core 1 (timing-critical ISR + tight polling loop).
+  // Extra headroom beyond rfTask's own small locals now that RF_CAPTURE no
+  // longer builds a large JSON document on this stack (see rfTask()).
+  xTaskCreatePinnedToCore(rfTask, "rfTask", 6144, nullptr, 2, nullptr, 1);
+  // Wi-Fi/BLE work pinned to core 0, isolated from the CC1101 ISR core.
+  xTaskCreatePinnedToCore(wifiTask, "wifiTask", 10240, nullptr, 1, nullptr, 0);
+
+  printLine("VERSION ArcticRF-1.0");
+}
+
+void loop() {
+  // Non-blocking line read: never wait on Serial, so a slow phone-side
+  // writer can't stall RF/Wi-Fi task dispatch, and a big Wi-Fi/BLE job
+  // (already offloaded to its own core/task above) never stalls this.
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      handleCommand(serialBuf);
+      serialBuf = "";
+    } else if (c != '\r') {
+      serialBuf += c;
+      if (serialBuf.length() > 512) serialBuf = ""; // guard against garbage
+    }
+  }
+  vTaskDelay(2 / portTICK_PERIOD_MS);
+}
